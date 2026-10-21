@@ -1,83 +1,92 @@
-# 发布到 GitHub（一次性）
+# 发布到 GitHub
 
-本地仓库已经建好，首次提交为 `feat: 手机控制 Windows 电脑（pcrelay 中继 + SSH 双通道）`。
-只差推到远端。
+目标仓库（你已在网页上建好，空仓库）：
 
-## 方式 A：给我一个令牌，我全自动建库 + 推送
-
-1. GitHub → 右上头像 → **Settings** → 左下 **Developer settings**
-2. **Personal access tokens** → **Fine-grained tokens** → **Generate new token**
-3. 设置：
-   - **Repository access** → *All repositories*（首次建库需要）或先建空仓库再选 *Only select repositories*
-   - **Permissions**：
-     - `Administration` → **Read and write**（创建仓库）
-     - `Contents` → **Read and write**（推送代码）
-   - **Expiration**：7 天即可
-4. 生成后复制 `github_pat_...`，发给我，我执行：
-
-```sh
-GITHUB_TOKEN=github_pat_xxx ./bin/push-github.sh phone-control-pc private
+```
+https://github.com/fu-anxiang/agentphone-control-pc
 ```
 
-用完立刻到同一页面 **Revoke** 删掉这个令牌。
+本地分支 `main` 已提交，只剩推送。两种方式，任选其一。
 
-> 令牌只会作为环境变量传给这一次 `git push`，**不会写进 `.git/config`、
-> 不会进任何文件、也不会出现在 `git remote -v`**（脚本用 `-c http.extraheader`
-> 临时注入，并把 remote 设成不带凭据的 https 地址）。
+## 方式 1（推荐）：deploy key —— 不用给任何令牌
 
-## 方式 B：你自己推（令牌不经手我）
+已在本机生成好一对专用密钥：
 
-在你自己的终端里：
-
-```sh
-cd phone-control-pc
-
-# 1. 在网页上先建一个空仓库（不要勾 README / .gitignore / license）
-#    https://github.com/new
-
-# 2. 关联并推送
-git remote add origin https://github.com/<你的用户名>/phone-control-pc.git
-git branch -M main
-git push -u origin main
+```
+私钥：~/.ssh/gh_agentphone_deploy          （留在手机里，不外传）
+公钥：ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN6WcmjuEdSjmg2HPgSqCwCZ9YWVKrtF2AOcL01PIfHE coomi-deploy@agentphone-control-pc
 ```
 
-用 SSH 的话：
+1. 打开 https://github.com/fu-anxiang/agentphone-control-pc/settings/keys
+2. **Add deploy key** → Title 随便填（如 `coomi-phone`）→ Key 粘贴上面那行公钥
+3. ✅ 勾选 **Allow write access**（必须，否则只能读）
+4. **Add key**
+
+然后跟我说一声，我执行：
 
 ```sh
-git remote add origin git@github.com:<你的用户名>/phone-control-pc.git
-git push -u origin main
+./bin/push-existing.sh
 ```
 
-## 方式 C：只导出压缩包，稍后自己推
+这把 key 只对这一个仓库有写权限，泄露影响面比 PAT 小，而且随时可在同一页面删除。
+
+## 方式 2：给 PAT
+
+GitHub → Settings → Developer settings → **Fine-grained tokens** → Generate：
+
+- Repository access → 选 *Only select repositories* → `agentphone-control-pc`
+- `Contents` → **Read and write**
 
 ```sh
-./bin/make-kit.py      # 生成 dist/pc-control-kit.zip
+GITHUB_TOKEN=github_pat_xxx ./bin/push-existing.sh
 ```
 
-## 后续升级怎么拉取
+令牌只作为环境变量传给这一次 `git push`（用 `-c http.extraheader`），
+**不写进 `.git/config`、不进任何文件、不出现在 `git remote -v`**。用完在 GitHub 上 Revoke。
 
-仓库里已经带好：
+## 推送脚本做了什么
 
-- `CHANGELOG.md` —— 版本与变更（v0.1 → v0.3）
-- `docs/PROTOCOL.md` —— 接口实测表，接口一变照着重跑 `dev/probe_api*.py`
-- `dev/suite_real.py` / `dev/suite_ops.py` —— 回归套件，改完先跑这个
+`bin/push-existing.sh`
 
-新机器上继续开发：
+- 有 `GITHUB_TOKEN` → 走 HTTPS + `http.extraheader`（令牌不落盘）
+- 没有 → 走 SSH + `~/.ssh/gh_agentphone_deploy`
+- 先测认证，未授权就打印公钥与添加链接，不会瞎重试
+- 推送后打印仓库地址
+
+## 推完以后
 
 ```sh
-git clone https://github.com/<你>/phone-control-pc.git
-cd phone-control-pc
-install -m 0755 bin/pcc /usr/local/bin/pcc     # 装到手机端
+git clone https://github.com/fu-anxiang/agentphone-control-pc.git
+cd agentphone-control-pc
+install -m 0755 bin/pcc /usr/local/bin/pcc
 pcc init "<电脑端打印的两行地址>"
-pcc diag                                        # 10 项体检
+pcc diag        # 10 项体检，全绿即可用
 ```
 
-## 提交前自检（重要）
+升级：`git pull origin main`。
+
+改完代码先跑回归（需要电脑端在线）：
+
+```sh
+cp bin/pcc /tmp/pccmod.py
+python3 dev/suite_real.py     # 24 项接口
+python3 dev/suite_ops.py      # 9 项运维
+```
+
+## 提交前自检
 
 ```sh
 git status --short
-git grep -n "room=" -- '*.py' '*.md' | grep -v "<令牌"   # 别把真实令牌提交上去
+git grep -n "room=[A-Za-z0-9_-]\{20,\}" || echo "✓ 没有真实令牌"
 ```
 
 `.gitignore` 已排除：`config.json`、`ROOM.txt`、`.pcc.env`、`logs/`、`dist/`、
-`*.supervisor.*`、`qr*.png`、`shots/`。
+`*.supervisor.*`、`qr*.png`、`shots/`、`__pycache__/`。
+
+## 可选：仓库设置建议
+
+推上去之后可以在网页上补：
+
+- **About** → Description：`用手机控制 Windows 电脑：pcrelay 中继 + SSH 双通道`
+- **Topics**：`windows` `remote-control` `android` `automation` `ssh` `tailscale`
+- **Settings → General → Default branch**：确认是 `main`
