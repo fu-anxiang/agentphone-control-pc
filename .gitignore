@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时生成（不入库）
+dist/
+*.log
+qrview.png
+qr_view.png
+qr_*.png
+.b64tmp
+pcc-svc.bat
+bridge.log
+
+# 本机配置与令牌 —— 绝不提交
+.pcc.env
+env.bak
+config.json
+ROOM.txt
+*.supervisor.pid
+.supervisor.*
+
+# 截图/临时产物
+shots/
+shots2/
+tmp/
+*.jpg.b64tmp
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,1055 @@
+#!/usr/bin/env python3
+"""
+pcc —— 手机端通过 pcrelay 边缘中继控制电脑（PC Agent API 客户端）
+
+对接电脑端真实协议（已逐条实测）：
+    POST https://pcrelay.pages.dev/api?room=<令牌A>
+    body {"m": 方法, "p": {...}}
+    resp {"id":..,"ok":true,"r":{...}}  或  {"id":..,"ok":false,"e":"..."}
+
+配置（~/.pcc.env，或环境变量）：
+    PCC_BASE=https://pcrelay.pages.dev/api
+    PCC_ROOM=<Agent 令牌，32 位>
+    PCC_VIEW_ROOM=<投屏令牌，32 位>
+
+初始化（把电脑端打印的两行地址整段粘过来）：
+    pcc init "https://pcrelay.pages.dev/api?room=AAAA https://pcrelay.pages.dev/?room=BBBB"
+
+子命令：
+    pcc init <地址|令牌> [令牌B]  解析并写入配置
+    pcc conf                    显示当前配置
+    pcc link                    打印 API 与投屏地址
+    pcc info                    机器信息（分辨率/锁屏/忙碌）
+    pcc session                 会话状态（是否锁屏、空闲秒数、保活）
+    pcc awake on|off            开/关防锁屏保活（电脑空闲时抖动鼠标）
+    pcc ping                    探活
+    pcc sh "<命令>"             执行 PowerShell，打印 out/err
+    pcc shot [文件]              整屏截图 → /workspace/shots/pc-*.jpg
+    pcc move <x> <y> [--norm]   鼠标移动（默认像素坐标；--norm 用 0~1）
+    pcc click [left|right|middle] [次数] [x y]   点击
+    pcc dblclick                双击左键
+    pcc scroll <dy>             滚动（正数向下）
+    pcc drag <x1 y1 x2 y2>      按下-移动-松开
+    pcc type "<文本>"            Unicode 打字（含中文）
+    pcc key <键> [ctrl alt shift win]            按键
+    pcc win [list|focus <标题>]  窗口列表 / 抢前台
+    pcc win click <标题> [fx] [fy]  召前台并在窗口内相对位置点击（默认正中）
+    pcc app start <exe|文档|URL> 启动程序/文档/网址
+    pcc app kill <pid|名称>      结束进程
+    pcc fs ls "<路径>"
+    pcc fs read "<路径>"         读文本（返回 text/truncated）
+    pcc fs write "<路径>" "<文本>"   写文本
+    pcc fs mkdir "<路径>"
+    pcc fs rm "<路径>"
+    pcc fs get "<远程>" "<本地>"   下载（二进制走 PowerShell+base64）
+    pcc fs put "<本地>" "<远程>"   上传（同上）
+    pcc clip [get|set "<文本>"]
+    pcc pw <action> [k=v ...]    goto/open/url/click/fill/press/text/html/eval/count/screenshot/back/newpage/pages
+    pcc pwscript "<python>"      电脑端执行 Python 片段（返回 result）
+    pcc raw '<json>'             直接发送 {"m":..,"p":..}
+
+  电脑端运维（对应 pcremote 目录里的 supervisor / 日志 / 投屏通道 / 局域网模式）：
+    pcc svc [status|start|stop|restart] [--only bridge|view]   守护进程
+    pcc logs [bridge|view|supervisor|all] [-n 行数] [-g 关键字]  日志尾部
+    pcc view [status|url|qr [本地路径]]   触屏画面通道（client_relay）
+    pcc room                     电脑端 ROOM.txt 与本机配置比对
+    pcc lan [status|start|stop]  局域网直连模式（server.py:8765，同 WiFi 最流畅）
+    pcc startup [status|install|remove]   开机自启项
+    pcc nolock [status|apply]    防锁屏硬化（apply 需 UAC 确认）
+    pcc net                      电脑的网卡 IP 与中继可达性
+    pcc diag                     一键体检
+"""
+import base64
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ENV_FILE = os.path.expanduser("~/.pcc.env")
+DEFAULT_BASE = "https://pcrelay.pages.dev/api"
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+
+
+def load_conf():
+    base = os.environ.get("PCC_BASE")
+    room = os.environ.get("PCC_ROOM")
+    view = os.environ.get("PCC_VIEW_ROOM")
+    if os.path.exists(ENV_FILE):
+        for line in open(ENV_FILE, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k == "PCC_BASE" and not base:
+                base = v
+            if k == "PCC_ROOM" and not room:
+                room = v
+            if k == "PCC_VIEW_ROOM" and not view:
+                view = v
+    return (base or DEFAULT_BASE, room or "", view or "")
+
+
+BASE, ROOM, VIEW_ROOM = load_conf()
+
+# Cloudflare 会按 UA 拦截默认的 Python-urllib（1010），必须带正常 UA
+HEADERS = {
+    "content-type": "application/json",
+    "user-agent": "Mozilla/5.0 (Linux; Android 14; Coomi) pcc/2.0",
+    "accept": "application/json",
+}
+
+_SCREEN = None      # 缓存 info 里的分辨率，供归一化坐标换算
+
+
+def die(msg, code=1):
+    print(f"× {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def out(text=""):
+    print(text if text is not None else "")
+
+
+def parse_tokens(text):
+    """从粘贴的地址或裸令牌里提取 (api_base, agent_room, view_room)。"""
+    base = DEFAULT_BASE
+    agent = view = ""
+    for m in re.finditer(r"(https?://[^\s\"'<>]+)", text):
+        u = m.group(1)
+        q = urllib.parse.urlparse(u)
+        room = urllib.parse.parse_qs(q.query).get("room", [""])[0]
+        if q.path.rstrip("/").endswith("/api"):
+            agent = room or agent
+            base = f"{q.scheme}://{q.netloc}/api"
+        elif room:
+            view = room or view
+    if not agent or not view:
+        cands = re.findall(r"[A-Za-z0-9_-]{16,64}", text)
+        cands = [c for c in cands if not c.startswith(("http", "pcrelay", "pages"))
+                 and c.lower() not in ("api", "room")]
+        seen, uniq = set(), []
+        for c in cands:
+            if c not in seen:
+                seen.add(c)
+                uniq.append(c)
+        if not agent and uniq:
+            agent = uniq.pop(0)
+        if not view and uniq:
+            view = uniq.pop(0)
+    return base, agent, view
+
+
+def call(m, timeout=60, **p):
+    """调用电脑端方法，成功返回 r（dict），失败 die 并给出电脑端的错误原因。"""
+    if not ROOM:
+        die(f"未配置 Agent 令牌：先跑  pcc init <电脑端打印的地址>  或编辑 {ENV_FILE}")
+    url = f"{BASE}?room={urllib.parse.quote(ROOM)}"
+    body = json.dumps({"m": m, "p": p}).encode()
+    req = urllib.request.Request(url, data=body, headers=HEADERS)
+    t0 = time.time()
+    raw, last_err, ok_status = "", None, False
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+            ok_status = True
+            break
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            ok_status = False
+            break
+        except Exception as e:                     # 断连/超时/重置：退避重试
+            last_err = e
+            time.sleep(0.6 * (attempt + 1))
+    if not raw:
+        if isinstance(last_err, TimeoutError):
+            die(f"{m} 超时（{timeout}s，电脑端没响应）")
+        if isinstance(last_err, urllib.error.URLError):
+            die(f"连不上中继 {BASE}：{getattr(last_err, 'reason', last_err)}")
+        die(f"{m} 失败：{type(last_err).__name__}: {last_err}")
+    dt = int((time.time() - t0) * 1000)
+    try:
+        j = json.loads(raw)
+    except Exception:
+        return {"_raw": raw, "_ms": dt}
+    if j.get("ok") is False:
+        if j.get("e") == "pc_offline":
+            die("电脑离线：电脑端客户端没连上（核对令牌：pcc conf）")
+        die(f"电脑端报错：{j.get('e')}")
+    r = j.get("r", j)
+    if isinstance(r, dict):
+        r.setdefault("_ms", dt)
+        if r.get("ok") is False:
+            die(f"电脑端返回失败：{r.get('e') or r.get('hint') or '（无错误信息，检查参数名）'}")
+    return r
+
+
+def screen_size():
+    global _SCREEN
+    if not _SCREEN:
+        info = call("info")
+        sc = info.get("screen") or {}
+        _SCREEN = (int(sc.get("w") or 1920), int(sc.get("h") or 1080))
+    return _SCREEN
+
+
+def to_px(x, y, norm=False):
+    """默认按像素；norm=True 时把 0~1 换算成物理像素。"""
+    if not norm:
+        return int(round(float(x))), int(round(float(y)))
+    if not (0.0 <= float(x) <= 1.0 and 0.0 <= float(y) <= 1.0):
+        die(f"--norm 需要 0~1 的比例坐标，收到 ({x}, {y})；像素坐标请去掉 --norm")
+    w, h = screen_size()
+    return int(round(float(x) * w)), int(round(float(y) * h))
+
+
+def kv_pairs(args):
+    p = {}
+    for a in args:
+        if "=" in a:
+            k, v = a.split("=", 1)
+            p[k] = v
+        else:
+            die(f"参数要写成 key=value：{a}")
+    return p
+
+
+def ps_command(cmd, timeout=120):
+    """在电脑上跑一段 PowerShell，返回 stdout 原文。"""
+    r = call("shell", cmd=cmd, timeout=timeout)
+    if r.get("_raw"):
+        return r["_raw"]
+    if int(r.get("code") or 0) != 0:
+        die(f"PowerShell 返回 {r.get('code')}：{(r.get('err') or '').strip()[:400]}")
+    return r.get("out") or ""
+
+
+def ps_safe(cmd, timeout=60, default=""):
+    """跑 PowerShell，失败也不中断（用于读可选文件/探测）。"""
+    try:
+        r = call("shell", cmd=cmd, timeout=timeout)
+    except SystemExit:
+        return default
+    if r.get("_raw"):
+        return r["_raw"]
+    return (r.get("out") or "").strip() or default
+
+
+# =====================================================================
+#  电脑端运维（pcremote 目录：supervisor / 日志 / 投屏 / 局域网 / 自启）
+# =====================================================================
+PCREMOTE = os.environ.get("PCC_PCREMOTE",
+                          "C:/Users/24335/Documents/for_phone/pcremote")
+
+
+def procs():
+    """返回 pcremote 相关 python 进程 [{'pid':..,'cmd':..}]。"""
+    out = ps_command(r"""Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
+  Where-Object { $_.CommandLine -match 'pcremote' } |
+  ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }""", timeout=60)
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or "\t" not in line:
+            continue
+        pid, cmd = line.split("\t", 1)
+        rows.append({"pid": int(pid), "cmd": cmd.strip()})
+    return rows
+
+
+def classify(rows):
+    """把进程命令分成 supervisor / bridge / view / lan。"""
+    got = {"supervisor": [], "bridge": [], "view": [], "lan": []}
+    for r in rows:
+        c = r["cmd"].lower()
+        if "supervisor.py" in c:
+            got["supervisor"].append(r)
+        elif "agent_bridge.py" in c:
+            got["bridge"].append(r)
+        elif "client_relay.py" in c:
+            got["view"].append(r)
+        elif "server.py" in c:
+            got["lan"].append(r)
+    return got
+
+
+def lan_ips():
+    out = ps_command(
+        r"""(Get-NetIPAddress -AddressFamily IPv4 |
+  Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.|172\.1[7-9]\.|172\.2[0-9]\.|172\.3[0-1]\.)' }).IPAddress -join ','""",
+        timeout=60)
+    return [x.strip() for x in out.strip().split(",") if x.strip()]
+
+
+def ensure_svc_bat():
+    """在电脑上写一个 ASCII 批处理（stop/restart 用），返回其路径。
+
+    为什么要批处理：supervisor.py --stop 会 taskkill /T 杀整棵树，
+    连正在执行命令的 PowerShell 一起死，所以必须由一个「脱管进程」来跑后续步骤。
+    PowerShell 里 \" 不是转义符，字符串拼接极易出错，写成 .bat 最稳。
+    """
+    bat = PCREMOTE.rsplit("/", 1)[0] + "/pcc-svc.bat"
+    # python 路径现场查，不写死（换机器/换 Python 版本都能用）
+    py = ps_command(r"(Get-Command python).Source", timeout=60).strip()
+    if not py:
+        die("电脑上找不到 python.exe")
+    pyw = ps_command(
+        r"$p=(Get-Command python).Source; $w=Join-Path (Split-Path $p) 'pythonw.exe';"
+        r"if (Test-Path $w) { $w } else { $p }", timeout=60).strip() or py
+    sup = PCREMOTE + "/supervisor.py"
+    content = (
+        "@echo off\r\n"
+        "rem generated by pcc (stop / restart) -- ASCII only\r\n"
+        "set PY=" + py.replace("/", "\\") + "\r\n"
+        "set PYW=" + pyw.replace("/", "\\") + "\r\n"
+        "set SUP=" + sup.replace("/", "\\") + "\r\n"
+        "set CD=" + PCREMOTE.replace("/", "\\") + "\r\n"
+        "cd /d \"%CD%\"\r\n"
+        "timeout /t 1 /nobreak >nul\r\n"
+        "\"%PY%\" \"%SUP%\" --stop >nul 2>&1\r\n"
+        "if /i \"%~1\"==\"stop\" goto :eof\r\n"
+        "timeout /t 3 /nobreak >nul\r\n"
+        "start \"\" \"%PYW%\" \"%SUP%\"\r\n"
+    )
+    call("fs", action="write", path=bat, content=content)
+    return bat
+
+
+def spawn_detached(bat, verb):
+    """用 WMI 起一个父进程不是 supervisor 的脱管进程来执行批处理。"""
+    ps = ("$c = 'cmd.exe /c \"" + bat + "\" " + verb + "' ; "
+          "Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+          "-Arguments @{CommandLine=$c; CurrentDirectory='" + PCREMOTE + "'} "
+          "| Select-Object -ExpandProperty ProcessId")
+    return ps_command(ps, timeout=60).strip()
+
+
+def cmd_svc(args):
+    sub = args[0] if args else "status"
+    only = ""
+    if "--only" in args:
+        i = args.index("--only")
+        only = args[i + 1] if len(args) > i + 1 else ""
+
+    if sub == "status":
+        got = classify(procs())
+        sup = got["supervisor"][0]["pid"] if got["supervisor"] else None
+        print(f"守护进程 supervisor : {'运行中 pid=' + str(sup) if sup else '未运行'}")
+        for name, label in (("bridge", "Agent API 通道"), ("view", "触屏画面通道"),
+                            ("lan", "局域网直连模式")):
+            rows = got[name]
+            if rows:
+                extra = ""
+                if name == "view":
+                    c = rows[0]["cmd"]
+                    for k in ("--fps", "--width", "--quality"):
+                        if k in c:
+                            extra += " " + k + c.split(k, 1)[1].strip().split()[0]
+                print(f"{label} : 运行中 pid=" + ",".join(str(r["pid"]) for r in rows) + extra)
+            else:
+                print(f"{label} : 未运行")
+        pidfile = ps_safe(f"Get-Content -Raw -LiteralPath '{PCREMOTE}/.supervisor.pid'")
+        print(f"\n锁文件 pid : {pidfile.strip() or '(无)'}")
+        return 0
+
+    if sub == "start":
+        pyw = ps_command(
+            r"$p=(Get-Command python).Source; $w=Join-Path (Split-Path $p) 'pythonw.exe';"
+            r"if (Test-Path $w) { $w } else { $p }", timeout=60).strip()
+        if not pyw:
+            die("电脑上找不到 python.exe")
+        extra = ["--only", only] if only else []
+        before = classify(procs())
+        if before["supervisor"]:
+            out(f"守护已在运行 pid={before['supervisor'][0]['pid']}（单实例锁，不重复启动）")
+            return 0
+        ps_command(
+            f"Start-Process -FilePath '{pyw}' -ArgumentList '\"{PCREMOTE}/supervisor.py\""
+            + (" " + " ".join(extra) if extra else "")
+            + f"' -WorkingDirectory '{PCREMOTE}' -WindowStyle Hidden", timeout=60)
+        time.sleep(4)
+        got = classify(procs())
+        if got["supervisor"]:
+            chans = ",".join(k for k in ("bridge", "view") if got[k]) or "（通道启动中）"
+            out(f"守护已启动 pid={got['supervisor'][0]['pid']}，通道：{chans}")
+        else:
+            die("启动失败（可能是单实例锁被占或 python 路径不对），用 pcc svc status 复查")
+        return 0
+
+    if sub == "stop":
+        if "--yes" not in args:
+            die("停守护会连 Agent API 通道一起停 —— 之后就再也无法远程把它拉起来了，"
+                "必须在电脑上手动启动。确认要在电脑旁操作请加 --yes：\n"
+                "  pcc svc stop --yes\n"
+                "只想重载配置/清卡死用：pcc svc restart（不需要在电脑旁）")
+        bat = ensure_svc_bat()
+        spawn_detached(bat, "stop")
+        time.sleep(6)
+        got = classify(procs())
+        left = [k for k in ("supervisor", "bridge", "view") if got[k]]
+        out("已停止（supervisor + bridge + view 全部退出）" if not left
+            else f"仍有残留：{left}，等几秒后 pcc svc status 复查")
+        return 0
+
+    if sub == "restart":
+        bat = ensure_svc_bat()
+        spawn_detached(bat, "restart")
+        out("已发起重启（脱管执行：停 → 3 秒 → 起）")
+        for i in range(7):
+            time.sleep(4)
+            got = classify(procs())
+            if got["supervisor"]:
+                out(f"新 supervisor pid={got['supervisor'][0]['pid']}（{4 * (i + 1)}s）")
+                time.sleep(4)
+                got = classify(procs())
+                chans = ",".join(k for k in ("bridge", "view") if got[k]) or "启动中"
+                out(f"通道：{chans}")
+                return 0
+        die("28 秒内没看到 supervisor 起来；请在电脑上手动跑 python supervisor.py")
+
+    die(f"未知 svc 子命令 {sub}（status/start/stop/restart）")
+
+
+def cmd_logs(args):
+    name = args[0] if args and not args[0].startswith("-") else "all"
+    n = 40
+    grep = None
+    if "-n" in args:
+        i = args.index("-n")
+        if len(args) > i + 1:
+            n = int(args[i + 1])
+    for key in ("-g", "--grep"):
+        if key in args:
+            i = args.index(key)
+            if len(args) > i + 1:
+                grep = args[i + 1]
+    files = {"bridge": "bridge.log", "view": "view.log",
+             "supervisor": "supervisor.log"}.items()
+    if name != "all":
+        files = [(k, v) for k, v in files if k == name]
+        if not files:
+            die(f"未知日志 {name}（bridge/view/supervisor/all）")
+    for key, fname in files:
+        path = f"{PCREMOTE}/logs/{fname}"
+        # 日志是 UTF-8 无 BOM，必须显式 -Encoding UTF8，否则 PS5.1 按 GBK 读出乱码
+        cmd = (f"Get-Content -LiteralPath '{path}' -Tail {n} -Encoding UTF8 "
+               "-ErrorAction SilentlyContinue")
+        if grep:
+            cmd += f" | Select-String -Pattern '{grep}'"
+        body = ps_command(cmd, timeout=60).strip()
+        out(f"=== {key} ({fname}) ===")
+        out(body or "(空)")
+        out()
+    return 0
+
+
+def cmd_view(args):
+    sub = args[0] if args else "status"
+    if sub == "status":
+        got = classify(procs())
+        if got["view"]:
+            cmdline = got["view"][0]["cmd"]
+            out(f"触屏画面通道 : 运行中 pid={got['view'][0]['pid']}")
+            out(f"启动参数     : {cmdline.split('client_relay.py', 1)[-1].strip()}")
+        else:
+            out("触屏画面通道 : 未运行（pcc svc start 或只跑 view：pcc svc start --only view）")
+        if VIEW_ROOM:
+            out(f"手机打开     : {BASE.split('/api')[0]}/?room={VIEW_ROOM}")
+        tail = ps_command(
+            f"Get-Content -LiteralPath '{PCREMOTE}/logs/view.log' -Tail 6 -Encoding UTF8 "
+            "-ErrorAction SilentlyContinue", timeout=60).strip()
+        if tail:
+            out("\n--- view.log 最近几行 ---")
+            out(tail)
+        return 0
+
+    if sub == "url":
+        if not VIEW_ROOM:
+            die("本机没配 PCC_VIEW_ROOM：pcc init <电脑端两行地址>")
+        out(f"{BASE.split('/api')[0]}/?room={VIEW_ROOM}")
+        return 0
+
+    if sub == "qr":
+        path = args[1] if len(args) > 1 else "/workspace/shots/qr_view.png"
+        url = f"{BASE.split('/api')[0]}/?room={VIEW_ROOM}"
+        # 电脑上有现成的 mkqr.py，直接调它生成（避免 PS 里嵌 python 的引号地狱）
+        ps_safe(f"python '{PCREMOTE}/mkqr.py' '{url}' '{PCREMOTE}/qr_view.png'",
+                timeout=90)
+        read_ps = ("$p='" + PCREMOTE + "/qr_view.png'; "
+                   "if (Test-Path $p) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($p)) }")
+        b64 = ps_safe(read_ps, timeout=90)
+        b64 = "".join(b64.split())
+        if not b64:
+            die("取二维码失败（电脑上缺 qrcode 模块？pip install qrcode pillow）")
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(b64))
+        out(f"二维码已保存 {path} ({os.path.getsize(path)} 字节)")
+        out(f"内容: {url}")
+        return 0
+
+    die(f"未知 view 子命令 {sub}（status/url/qr）")
+
+
+def cmd_room(args):
+    txt = ps_command(f"Get-Content -LiteralPath '{PCREMOTE}/ROOM.txt' -Raw -Encoding UTF8 "
+                     "-ErrorAction SilentlyContinue", timeout=60).strip()
+    if not txt:
+        die("电脑端没有 ROOM.txt（supervisor 启动时会生成）")
+    out("--- 电脑端 ROOM.txt ---")
+    out(txt)
+    a = re.search(r"api\?room=([A-Za-z0-9_-]+)", txt)
+    v = re.search(r"/\?room=([A-Za-z0-9_-]+)", txt)      # 投屏是 /?room=，API 是 /api?room=
+    out("\n--- 与本机配置比对 ---")
+    out(f"Agent  {'一致' if a and a.group(1) == ROOM else '不一致'}  "
+        f"电脑={a.group(1) if a else '?'}  手机={ROOM or '(未设)'}")
+    out(f"View   {'一致' if v and v.group(1) == VIEW_ROOM else '不一致'}  "
+        f"电脑={v.group(1) if v else '?'}  手机={VIEW_ROOM or '(未设)'}")
+    return 0
+
+
+def cmd_lan(args):
+    sub = args[0] if args else "status"
+    got = classify(procs())
+    if sub == "status":
+        if got["lan"]:
+            out(f"局域网直连 : 运行中 pid={got['lan'][0]['pid']}")
+        else:
+            out("局域网直连 : 未运行（pcc lan start，同 WiFi 下 9~15 fps，比边缘中继流畅）")
+        listening = ps_command(
+            "(Get-NetTCPConnection -LocalPort 8765 -State Listen "
+            "-ErrorAction SilentlyContinue | Measure-Object).Count", timeout=60).strip()
+        out(f"8765 监听 : {'是' if listening.strip() != '0' else '否'}")
+        out(f"本机 IP   : {', '.join(lan_ips()) or '(取不到)'}")
+        fw = ps_command(
+            "(Get-NetFirewallRule -DisplayName 'PC Remote 8765' "
+            "-ErrorAction SilentlyContinue | Measure-Object).Count", timeout=60).strip()
+        out(f"防火墙规则 : {'已存在' if fw.strip() != '0' else '未创建（首次连不上时 Windows 会弹允许提示）'}")
+        return 0
+
+    if sub == "start":
+        if got["lan"]:
+            die(f"已经在跑（pid {got['lan'][0]['pid']}），先 pcc lan stop")
+        token = re.sub(r"[^A-Za-z0-9_-]", "", base64.urlsafe_b64encode(os.urandom(9)).decode())[:12]
+        pyw = ps_command(
+            r"$p=(Get-Command python).Source; $w=Join-Path (Split-Path $p) 'pythonw.exe';"
+            r"if (Test-Path $w) { $w } else { $p }", timeout=60).strip()
+        ps_command(
+            f"if (-not (Get-NetFirewallRule -DisplayName 'PC Remote 8765' "
+            f"-ErrorAction SilentlyContinue)) {{ try {{ New-NetFirewallRule "
+            f"-DisplayName 'PC Remote 8765' -Direction Inbound -Protocol TCP -LocalPort 8765 "
+            f"-Action Allow -Profile Private -ErrorAction Stop | Out-Null }} catch {{}} }}; "
+            f"Start-Process -FilePath '{pyw}' -ArgumentList "
+            f"'\"{PCREMOTE}/server.py\" --port 8765 --fps 15 --width 1280 --quality 55 "
+            f"--token {token}' -WorkingDirectory '{PCREMOTE}' -WindowStyle Hidden", timeout=90)
+        time.sleep(3)
+        if not classify(procs())["lan"]:
+            die("启动失败，检查 server.py 是否存在 / 依赖 aiohttp+pillow")
+        ips = lan_ips()
+        out(f"局域网直连已启动（token={token}）")
+        for ip in ips[:2]:
+            out(f"  http://{ip}:8765/?t={token}")
+        out("同一 WiFi 下手机浏览器打开上面地址即可（比边缘中继流畅）")
+        return 0
+
+    if sub == "stop":
+        if not got["lan"]:
+            out("本来就没在跑")
+            return 0
+        ps_command("Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | "
+                   "Where-Object { $_.CommandLine -match 'server\\.py' -and "
+                   "$_.CommandLine -match 'pcremote' } | "
+                   "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }", timeout=60)
+        out("已停止局域网直连")
+        return 0
+
+    die(f"未知 lan 子命令 {sub}（status/start/stop）")
+
+
+def cmd_startup(args):
+    sub = args[0] if args else "status"
+    lnk = ps_command(
+        r"""$s=[Environment]::GetFolderPath('Startup'); Test-Path (Join-Path $s 'PC Remote Agent.lnk')""",
+        timeout=60).strip()
+    if sub == "status":
+        out(f"开机自启 : {'已安装' if lnk.lower() == 'true' else '未安装'}")
+        if lnk.lower() == "true":
+            out(ps_command(
+                r"""$s=[Environment]::GetFolderPath('Startup')
+$sh=New-Object -ComObject WScript.Shell
+$x=$sh.CreateShortcut((Join-Path $s 'PC Remote Agent.lnk'))
+"目标: " + $x.TargetPath
+"参数: " + $x.Arguments
+"目录: " + $x.WorkingDirectory""", timeout=60).strip())
+        else:
+            out("安装：pcc startup install（免管理员，装到当前用户启动文件夹）")
+        return 0
+    if sub in ("install", "remove"):
+        flag = "-Remove" if sub == "remove" else ""
+        out(ps_command(f"powershell -NoProfile -ExecutionPolicy Bypass "
+                       f"-File '{PCREMOTE}/install_startup.ps1' {flag}", timeout=120).strip())
+        return 0
+    die(f"未知 startup 子命令 {sub}（status/install/remove）")
+
+
+def cmd_nolock(args):
+    sub = args[0] if args else "status"
+    if sub == "status":
+        out(ps_command(r"""$d = Get-ItemProperty 'HKCU:\Control Panel\Desktop' -ErrorAction SilentlyContinue
+"屏保       : " + $(if ($d.ScreenSaveActive -eq '0') { '已关闭' } else { '开着（' + $d.ScreenSaveActive + '）' })
+"屏保密码   : " + $(if ($d.ScreenSaverIsSecure -eq '0') { '关闭' } else { '开启' })
+$p = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue
+"不活动锁定 : " + $(if ($p.InactivityTimeoutSecs -eq 0) { '已禁用（0）' } else { '未设置' })
+$q = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization' -ErrorAction SilentlyContinue
+"登录锁屏页 : " + $(if ($q.NoLockScreen -eq 1) { '已跳过' } else { '未设置' })
+"电源(AC)   :"
+powercfg /query SCHEME_CURRENT SUB_VIDEO VIDEOIDLE 2>$null | Select-String '当前交流电源设置索引|Current AC Power Setting' | ForEach-Object { '  显示器超时 ' + $_.ToString().Split(':')[-1].Trim() }""",
+                          timeout=90).strip())
+        sess = call("session")
+        out(f"当前会话   : {'锁屏中' if sess.get('locked') else '未锁屏'}  "
+            f"空闲 {sess.get('idle')}s  保活 {'开' if sess.get('keep_awake') else '关'}")
+        out("\n需要更彻底（CONSOLELOCK=0 / NoLockScreen）时：pcc nolock apply"
+            "（会在电脑上弹 UAC，需你点一下「是」）")
+        return 0
+    if sub == "apply":
+        ps_command(f"Start-Process -FilePath 'powershell' -Verb RunAs -ArgumentList "
+                   f"'-NoProfile','-ExecutionPolicy','Bypass','-File','{PCREMOTE}/never_lock_admin.ps1'",
+                   timeout=60)
+        out("已在电脑上发起提权执行 never_lock_admin.ps1 —— 请在那台电脑上点「是」")
+        out("完成后 pcc nolock status 复查")
+        return 0
+    die(f"未知 nolock 子命令 {sub}（status/apply）")
+
+
+def cmd_net(args):
+    out(f"本机 IP : {', '.join(lan_ips()) or '(取不到)'}")
+    # PowerShell 走系统代理不稳，用 python 直连（与桥同环境，结果更有参考价值）
+    pub = ps_safe(
+        "python -c \"import urllib.request as u;"
+        "print(u.urlopen('https://api.ipify.org',timeout=8).read().decode())\" 2>$null",
+        timeout=40, default="N/A")
+    out(f"公网出口: {pub}")
+    br = classify(procs())
+    out(f"通道连接: Agent {'在线' if br['bridge'] else '离线'} / "
+        f"投屏 {'在线' if br['view'] else '离线'}")
+    # 能执行到这里说明电脑→中继这条路是通的（请求就是这么来回的）
+    rtt = call("ping", timeout=20).get("_ms")
+    out(f"中继往返: {rtt} ms（能收到这条回复本身就证明中继可达）")
+    return 0
+
+
+def cmd_diag(args):
+    ok = fail = 0
+
+    def item(name, fn):
+        nonlocal ok, fail
+        try:
+            v = fn()
+            ok += 1
+            print(f"[OK  ] {name:22} {v}")
+        except SystemExit:
+            fail += 1
+            print(f"[FAIL] {name:22} 电脑端报错")
+        except Exception as e:
+            fail += 1
+            print(f"[FAIL] {name:22} {type(e).__name__}: {e}")
+
+    item("边缘中继", lambda: call("ping", timeout=20).get("pong") and "ping 通")
+    item("电脑信息", lambda: f"{call('info').get('host')} {call('info').get('screen')}")
+    item("会话状态", lambda: "锁屏" if call("session").get("locked") else "未锁屏")
+    got = classify(procs())
+    item("守护进程", lambda: f"pid={got['supervisor'][0]['pid']}" if got["supervisor"] else "未运行")
+    item("Agent 通道", lambda: f"pid={got['bridge'][0]['pid']}" if got["bridge"] else "未运行")
+    item("投屏通道", lambda: f"pid={got['view'][0]['pid']}" if got["view"] else "未运行")
+    item("开机自启", lambda: ps_command(
+        r"""$s=[Environment]::GetFolderPath('Startup'); Test-Path (Join-Path $s 'PC Remote Agent.lnk')""",
+        timeout=60).strip() == "True" and "已安装" or "未安装")
+    item("截图", lambda: f"{len(call('screenshot', quality=40, max_width=800).get('b64') or '')//1024}KB")
+    item("PowerShell", lambda: call("shell", cmd="hostname").get("out", "").strip())
+    item("文件读写", lambda: pcc_fs_roundtrip())
+    print(f"\n通过 {ok} 项，失败 {fail} 项")
+    return 0 if not fail else 1
+
+
+def pcc_fs_roundtrip():
+    p = "C:/Users/24335/pcc-diag.txt"
+    call("fs", action="write", path=p, content="diag")
+    txt = call("fs", action="read", path=p).get("text")
+    call("fs", action="delete", path=p)
+    if txt != "diag":
+        raise RuntimeError(f"回读不一致: {txt!r}")
+    return "写读删一致"
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__)
+        return 0
+    cmd, args = argv[1], argv[2:]
+
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+
+    # ---------------- 配置 ----------------
+    if cmd == "init":
+        if not args:
+            die("用法: pcc init <room|地址> [view_room]")
+        text = " ".join(args)
+        base, agent, view = parse_tokens(text)
+        if not agent:
+            die(f"没从输入里认出令牌：{text[:120]}")
+        if TOKEN_RE.match(args[-1]) and args[-1] != agent:
+            view = args[-1]
+        if view and view == agent:
+            die("Agent 令牌和投屏令牌不能相同（新版是两个独立令牌）")
+        for name, tok in (("Agent", agent), ("View", view)):
+            if tok and len(tok) != 32:
+                print(f"! {name} 令牌 {len(tok)} 位，新版通常是 32 位，请核对", file=sys.stderr)
+        with open(ENV_FILE, "w", encoding="utf-8") as f:
+            f.write(f"PCC_BASE={base}\nPCC_ROOM={agent}\n")
+            if view:
+                f.write(f"PCC_VIEW_ROOM={view}\n")
+        os.chmod(ENV_FILE, 0o600)
+        out(f"已写入 {ENV_FILE}")
+        out(f"  Agent API : {base}?room={agent}")
+        if view:
+            out(f"  投屏地址  : {base.split('/api')[0]}/?room={view}")
+        else:
+            out("  投屏房间  : 未设置（只影响手机浏览器看画面）")
+        return 0
+
+    if cmd == "conf":
+        out(f"配置文件  : {ENV_FILE} {'(存在)' if os.path.exists(ENV_FILE) else '(不存在)'}")
+        out(f"API 基址  : {BASE}")
+        out(f"Agent 令牌: {ROOM or '(未设置)'}  ({len(ROOM)} 位)")
+        out(f"View  令牌: {VIEW_ROOM or '(未设置)'}  ({len(VIEW_ROOM)} 位)")
+        return 0
+
+    if cmd == "link":
+        host = BASE.split("/api")[0]
+        out(f"Agent API : {BASE}?room={ROOM}")
+        out(f"触屏画面  : {host}/?room={VIEW_ROOM}" if VIEW_ROOM else
+            "触屏画面  : 未设置 PCC_VIEW_ROOM")
+        return 0
+
+    if cmd == "raw":
+        payload = json.loads(args[0])
+        r = call(payload["m"], **payload.get("p", {}))
+        out(json.dumps(r, ensure_ascii=False, indent=2))
+        return 0
+
+    # ---------------- 基础 ----------------
+    if cmd == "info":
+        r = call("info")
+        out(json.dumps(r, ensure_ascii=False, indent=2))
+        return 0
+
+    if cmd == "ping":
+        out(json.dumps(call("ping", timeout=20), ensure_ascii=False))
+        return 0
+
+    if cmd == "session":
+        r = call("session")
+        lock = "锁屏中（键鼠注入与桌面截图不可用）" if r.get("locked") else "未锁屏，全部功能可用"
+        out(f"会话    : {lock}")
+        out(f"空闲    : {r.get('idle')} 秒")
+        out(f"分辨率  : {r.get('screen')}")
+        out(f"保活    : {'开' if r.get('keep_awake') else '关'}  抖动 {r.get('jiggles')} 次")
+        if r.get("hint"):
+            out(f"提示    : {r['hint']}")
+        return 0
+
+    if cmd == "awake":
+        on = (args[0] if args else "on").lower() not in ("off", "0", "false", "no")
+        r = call("keep_awake", on=on)
+        out(f"防锁屏保活已{'开启' if r.get('on') else '关闭'}")
+        return 0
+
+    if cmd == "sh":
+        script = args[0] if args else sys.stdin.read()
+        r = call("shell", cmd=script, timeout=120)
+        if r.get("out"):
+            out(r["out"].rstrip())
+        if r.get("err"):
+            print(r["err"].rstrip(), file=sys.stderr)
+        code = int(r.get("code") or 0)
+        if code:
+            print(f"（退出码 {code}）", file=sys.stderr)
+        return 0
+
+    if cmd == "shot":
+        params = {}
+        if len(args) > 1:
+            params["max_width"] = int(args[1])
+        r = call("screenshot", timeout=120, **params)
+        b64 = r.get("b64") or ""
+        if not b64:
+            die(f"截图失败：{json.dumps(r, ensure_ascii=False)[:300]}")
+        path = args[0] if args else f"/workspace/shots/pc-{time.strftime('%H%M%S')}.jpg"
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(b64))
+        out(f"已保存 {path}  ({os.path.getsize(path)} 字节, {r.get('_ms')} ms)")
+        return 0
+
+    # ---------------- 输入 ----------------
+    if cmd == "move":
+        if len(args) < 2:
+            die("用法: pcc move <x> <y> [--norm]")
+        x, y = to_px(args[0], args[1], "--norm" in args)
+        call("input", action="move", x=x, y=y)
+        out(f"光标 → ({x}, {y})")
+        return 0
+
+    if cmd == "click":
+        button = "left"
+        n = 1
+        rest = list(args)
+        if rest and rest[0] in ("left", "right", "middle"):
+            button = rest.pop(0)
+        if rest and rest[0].isdigit():
+            n = int(rest.pop(0))
+        # 先定位再点（电脑端的 click 不接受坐标）
+        if len(rest) >= 2:
+            x, y = to_px(rest[0], rest[1], "--norm" in rest)
+            call("input", action="move", x=x, y=y)
+            time.sleep(0.05)
+        call("input", action="click", button=button, count=n)
+        out(f"已 {button} 点击 ×{n}" + (f" @ ({x}, {y})" if len(rest) >= 2 else ""))
+        return 0
+
+    if cmd == "dblclick":
+        call("input", action="dblclick")
+        out("已双击")
+        return 0
+
+    if cmd == "scroll":
+        if not args:
+            die("用法: pcc scroll <dy>   （正数向下）")
+        out(json.dumps(call("input", action="scroll", dy=int(args[0])), ensure_ascii=False))
+        return 0
+
+    if cmd == "drag":
+        if len(args) < 4:
+            die("用法: pcc drag <x1> <y1> <x2> <y2> [--norm]")
+        norm = "--norm" in args
+        x1, y1 = to_px(args[0], args[1], norm)
+        x2, y2 = to_px(args[2], args[3], norm)
+        call("input", action="move", x=x1, y=y1)
+        call("input", action="down", button="left")
+        time.sleep(0.15)
+        call("input", action="move", x=x2, y=y2)
+        time.sleep(0.15)
+        call("input", action="up", button="left")
+        out(f"已拖拽 ({x1},{y1}) → ({x2},{y2})")
+        return 0
+
+    if cmd == "type":
+        text = args[0] if args else sys.stdin.read()
+        call("input", action="type", value=text)      # 电脑端读的是 value
+        out(f"已输入 {len(text)} 个字符")
+        return 0
+
+    if cmd == "key":
+        if not args:
+            die("用法: pcc key <键> [ctrl alt shift win]")
+        k, mods = args[0], [a for a in args[1:] if a in ("ctrl", "alt", "shift", "win")]
+        p = {"action": "key", "key": k}
+        if mods:
+            p["mods"] = mods
+        call("input", **p)
+        out("已发送按键 " + "+".join(mods + [k]))
+        return 0
+
+    # ---------------- 窗口 / 程序 ----------------
+    if cmd == "win":
+        if not args or args[0] == "list":
+            r = call("windows")
+            items = r.get("windows") or r.get("items") or []
+            for w in items:
+                out(f"  {w.get('hwnd'):>9}  pid={w.get('pid'):<7} {w.get('title')}")
+            out(f"共 {len(items)} 个窗口")
+        elif args[0] == "click":
+            if len(args) < 2:
+                die("用法: pcc win click <标题片段> [fx] [fy]   （fx/fy 为窗口内 0~1 相对位置）")
+            match = args[1]
+            fx = float(args[2]) if len(args) > 2 else 0.5
+            fy = float(args[3]) if len(args) > 3 else 0.5
+            r = call("input", action="click_window", match=match, fx=fx, fy=fy)
+            win = r.get("window") or {}
+            out(f"已点 {win.get('title')} 的 ({fx}, {fy}) 处，光标 {r.get('cursor')}")
+        else:
+            match = args[1] if len(args) > 1 else ""
+            r = call("focus", match=match)          # 电脑端读的是 match
+            win = r.get("window") or {}
+            if not win:
+                die(f"没找到包含“{match}”的窗口（pcc win list 看看标题）")
+            fg = "前台" if win.get("foreground") else "未确认前台"
+            out(f"已切换到: {win.get('title')}  (hwnd={win.get('hwnd')}, {fg})")
+        return 0
+
+    if cmd == "app":
+        if len(args) < 2:
+            die("用法: pcc app start <exe|文档|URL>  或  pcc app kill <pid|名称>")
+        what = args[0]
+        if what == "start":
+            r = call("app", action="start", target=" ".join(args[1:]))
+            out(f"已启动 {r.get('started')}" + (f" (pid {r.get('pid')})" if r.get("pid") else ""))
+        elif what == "kill":
+            arg = args[1]
+            if arg.isdigit():
+                call("app", action="kill", pid=int(arg))
+                out(f"已结束 pid {arg}")
+            else:
+                call("app", action="kill", name=arg)
+                out(f"已结束进程 {arg}")
+        else:
+            die(f"未知 app 动作 {what}")
+        return 0
+
+    # ---------------- 文件 ----------------
+    if cmd == "fs":
+        if not args:
+            die("用法: pcc fs <ls|read|write|mkdir|rm|get|put> ...")
+        sub = args[0]
+        if sub == "ls":
+            r = call("fs", action="list", path=args[1] if len(args) > 1 else ".")
+            items = r.get("items") or []
+            for it in items:
+                kind = "DIR " if it.get("dir") else "    "
+                size = it.get("size") or 0
+                out(f"  {kind}{size:>12}  {it.get('name')}")
+            out(f"{r.get('path')}  共 {len(items)} 项")
+        elif sub == "read":
+            r = call("fs", action="read", path=args[1], max_bytes=400000)
+            out(r.get("text") or "")
+            if r.get("truncated"):
+                print("（内容已截断，完整内容用 pcc fs get 下载）", file=sys.stderr)
+        elif sub == "write":
+            content = args[2] if len(args) > 2 else sys.stdin.read()
+            append = "--append" in args
+            r = call("fs", action="write", path=args[1], content=content, append=append)
+            out(f"已{'追加' if append else '写入'} {r.get('path')} (共 {r.get('bytes')} 字节)")
+        elif sub == "mkdir":
+            r = call("fs", action="mkdir", path=args[1])
+            out(f"已创建 {r.get('path')}")
+        elif sub == "rm":
+            r = call("fs", action="delete", path=args[1])
+            out(f"已删除 {r.get('path')}")
+        elif sub == "get":
+            if len(args) < 3:
+                die("用法: pcc fs get \"<远程>\" \"<本地>\"")
+            remote, local = args[1], args[2]
+            # 先试文本直读（快）；失败再用 PowerShell 取 base64
+            r = call("fs", action="read", path=remote)
+            if r.get("text") and not r.get("truncated"):
+                with open(local, "w", encoding="utf-8") as f:
+                    f.write(r["text"])
+                out(f"已保存 {local} ({os.path.getsize(local)} 字节)")
+            else:
+                b64 = ps_command(
+                    f"$p='{remote}'; [Convert]::ToBase64String([IO.File]::ReadAllBytes($p))",
+                    timeout=180).strip()
+                if not b64:
+                    die("读取失败或文件为空")
+                with open(local, "wb") as f:
+                    f.write(base64.b64decode(b64))
+                out(f"已保存 {local} ({os.path.getsize(local)} 字节)")
+        elif sub == "put":
+            if len(args) < 3:
+                die("用法: pcc fs put \"<本地>\" \"<远程>\"")
+            local, remote = args[1], args[2]
+            data = open(local, "rb").read()
+            try:
+                text = data.decode("utf-8")
+                if "\x00" not in text:
+                    r = call("fs", action="write", path=remote, content=text, timeout=120)
+                    out(f"已上传 {remote} ({r.get('bytes')} 字节)")
+                    return 0
+            except UnicodeDecodeError:
+                pass
+            # 二进制：写 base64 到临时文件再解码
+            tmp = remote + ".b64tmp"
+            b64 = base64.b64encode(data).decode()
+            call("fs", action="write", path=tmp, content=b64, timeout=180)
+            try:
+                ps_command(f"$b=Get-Content -Raw -LiteralPath '{tmp}'; "
+                           f"[IO.File]::WriteAllBytes('{remote}', "
+                           f"[Convert]::FromBase64String($b.Trim()))", timeout=180)
+            finally:
+                # 无论成功失败都清掉中转文件，避免在电脑上留垃圾
+                ps_safe(f"Remove-Item -LiteralPath '{tmp}' -Force -ErrorAction SilentlyContinue")
+            out(f"已上传 {remote} ({len(data)} 字节)")
+        else:
+            die(f"未知 fs 子命令 {sub}")
+        return 0
+
+    # ---------------- 剪贴板 ----------------
+    if cmd == "clip":
+        if not args or args[0] == "get":
+            r = call("clip")
+            out(r.get("text") or "")
+        else:
+            val = args[1] if len(args) > 1 else sys.stdin.read()
+            call("clip", set=val)                 # 电脑端读的是 set
+            out(f"已写入剪贴板 ({len(val)} 字符)")
+        return 0
+
+    # ---------------- 浏览器 ----------------
+    if cmd == "pw":
+        if not args:
+            die("用法: pcc pw <goto|open|url|click|fill|press|text|html|eval|count|screenshot|back|newpage|pages> [k=v ...]")
+        action, rest = args[0], args[1:]
+        p = {"action": action}
+        p.update(kv_pairs(rest))
+        r = call("pw", timeout=120, **p)
+        if action == "screenshot" and r.get("b64"):
+            path = f"/workspace/shots/pw-{time.strftime('%H%M%S')}.png"
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(base64.b64decode(r["b64"]))
+            out(f"已保存 {path} ({os.path.getsize(path)} 字节)")
+        else:
+            r.pop("b64", None)
+            out(json.dumps(r, ensure_ascii=False)[:3000])
+        return 0
+
+    if cmd == "pwscript":
+        code = args[0] if args else sys.stdin.read()
+        r = call("pwscript", code=code, timeout=120)
+        out(json.dumps(r.get("result"), ensure_ascii=False)[:4000])
+        return 0
+
+    # ---------------- 电脑端运维 ----------------
+    if cmd == "svc":
+        return cmd_svc(args)
+    if cmd == "logs":
+        return cmd_logs(args)
+    if cmd == "view":
+        return cmd_view(args)
+    if cmd == "room":
+        return cmd_room(args)
+    if cmd == "lan":
+        return cmd_lan(args)
+    if cmd == "startup":
+        return cmd_startup(args)
+    if cmd == "nolock":
+        return cmd_nolock(args)
+    if cmd == "net":
+        return cmd_net(args)
+    if cmd == "diag":
+        return cmd_diag(args)
+
+    die(f"未知子命令: {cmd}（pcc help 看用法）")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

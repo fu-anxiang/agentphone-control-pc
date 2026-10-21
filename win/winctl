@@ -1,0 +1,162 @@
+#!/bin/bash
+# =====================================================================
+#  winctl —— 手机(ProotLinux)端控制 Windows 电脑
+#  子命令：setup / info / test / ssh / files / get / put / sync / rdp
+# =====================================================================
+set -uo pipefail
+
+CONF_DIR="$HOME/.win"
+KEY="$HOME/.ssh/coomi_win_ed25519"
+mkdir -p "$CONF_DIR"
+
+die()  { echo "× $*" >&2; exit 1; }
+info() { echo "[*] $*"; }
+ok()   { echo "[+] $*"; }
+
+usage() {
+cat <<'EOF'
+winctl —— 手机控制电脑 (SSH/SFTP 通道)
+
+  winctl setup 用户@地址 [端口]   记录电脑地址(默认22)，写入 ~/.ssh/config 的 Host win 并测试
+  winctl info                     显示当前配置
+  winctl test                     测试连通性并打印电脑信息
+  winctl ssh [命令...]            在电脑上执行命令；不带命令则进入交互 PowerShell
+  winctl files                    用 SFTP 浏览/下载/上传电脑文件
+  winctl get 远程路径 [本地路径]   下载文件或目录到手机
+  winctl put 本地路径 [远程路径]   上传文件或目录到电脑
+  winctl sync 本地目录 远程目录    用 tar over SSH 增量覆盖同步（Windows 自带 tar）
+  winctl rdp                     显示远程桌面(RDP)连接地址
+EOF
+}
+
+need_setup() { [ -f "$CONF_DIR/win.env" ] || die "还没配置电脑地址：先运行  winctl setup 用户名@地址"; }
+
+cmd_setup() {
+    local target="${1:-}" port="${2:-22}" user host cfg
+    [ -n "$target" ] || { usage; exit 1; }
+    user="${target%@*}"; host="${target#*@}"
+    [ "$user" != "$target" ] || die "格式要写成 用户名@地址，例如：winctl setup Administrator@100.88.1.23"
+    [ -f "$KEY" ] || die "缺少私钥 $KEY"
+    command -v ssh >/dev/null || die "客户机缺少 ssh 客户端"
+
+    mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+    cfg="$HOME/.ssh/config"; touch "$cfg"; chmod 600 "$cfg"
+    if grep -q '^# >>> winctl' "$cfg"; then
+        awk '/^# >>> winctl/{s=1} /^# <<< winctl/{s=0;next} !s' "$cfg" > "$cfg.new" && mv "$cfg.new" "$cfg"
+    fi
+    cat >> "$cfg" <<EOF
+# >>> winctl
+Host win
+  HostName $host
+  Port $port
+  User $user
+  IdentityFile $KEY
+  IdentitiesOnly yes
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+  StrictHostKeyChecking accept-new
+# <<< winctl
+EOF
+    chmod 600 "$cfg"
+    printf 'WIN_HOST=%s\nWIN_PORT=%s\nWIN_USER=%s\n' "$host" "$port" "$user" > "$CONF_DIR/win.env"
+    ok "已记录 $user@$host:$port"
+
+    info "抓取主机指纹 ..."
+    ssh-keyscan -p "$port" -H "$host" >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+
+    info "测试连接 ..."
+    if ssh -o BatchMode=yes -o ConnectTimeout=12 win 'echo CONNECT_OK' 2>&1 | grep -q CONNECT_OK; then
+        ok "免密登录成功，通道可用"
+        ssh -o BatchMode=yes -o ConnectTimeout=8 win 'hostname; $PSVersionTable.PSVersion.ToString()' 2>/dev/null | sed 's/^/    /'
+    else
+        echo "× 连接失败，排查顺序：" >&2
+        echo "  1) 电脑上 setup-pc.ps1 是否成功执行、sshd 是否在运行" >&2
+        echo "  2) 两台设备是否都在同一个 Tailscale 账号下（或同一 WiFi）" >&2
+        echo "  3) 地址/用户名是否写对：winctl info" >&2
+        echo "  4) 手动看报错：ssh -v win" >&2
+        exit 1
+    fi
+}
+
+cmd_info() {
+    if [ -f "$CONF_DIR/win.env" ]; then
+        # shellcheck disable=SC1091
+        . "$CONF_DIR/win.env"
+        echo "电脑地址 : $WIN_USER@$WIN_HOST:$WIN_PORT"
+    else
+        echo "电脑地址 : (未配置)"
+    fi
+    echo "私钥     : $KEY"
+    [ -f "$KEY.pub" ] && echo "公钥     : $(cat "$KEY.pub")"
+    echo "--- ~/.ssh/config (winctl 段) ---"
+    awk '/^# >>> winctl/{p=1} p; /^# <<< winctl/{p=0}' "$HOME/.ssh/config" 2>/dev/null
+}
+
+cmd_test() {
+    need_setup
+    # 注意：命令走 SSH 传到 Windows，统一用 ASCII，避免代码页乱码
+    ssh -o BatchMode=yes -o ConnectTimeout=12 win '
+      "host: " + $env:COMPUTERNAME
+      "user: " + $env:USERNAME
+      "os:   " + (Get-CimInstance Win32_OperatingSystem).Caption
+      "disk:"
+      Get-PSDrive -PSProvider FileSystem | Where-Object Used | Format-Table Name,@{n="UsedGB";e={[math]::Round($_.Used/1GB,1)}},@{n="FreeGB";e={[math]::Round($_.Free/1GB,1)}} -AutoSize | Out-String
+    '
+}
+
+cmd_ssh() {
+    need_setup
+    if [ $# -eq 0 ]; then exec ssh win; fi
+    ssh win "$@"
+}
+
+cmd_files() { need_setup; exec sftp win; }
+
+cmd_get() {
+    need_setup
+    [ -n "${1:-}" ] || die "用法: winctl get 远程路径 [本地路径]"
+    local remote="$1" local_dest="${2:-.}"
+    scp -r win:"$remote" "$local_dest" || die "下载失败（Windows 路径请用正斜杠，例如 C:/Users/me/a.txt）"
+    ok "已下载到 $local_dest"
+}
+
+cmd_put() {
+    need_setup
+    [ -n "${1:-}" ] || die "用法: winctl put 本地路径 [远程路径]"
+    local src="$1" remote_dest="${2:-/}"   # '/' = 对方用户主目录
+    scp -r "$src" win:"$remote_dest" || die "上传失败"
+    ok "已上传到 $remote_dest"
+}
+
+cmd_sync() {
+    need_setup
+    [ -n "${1:-}" ] && [ -n "${2:-}" ] || die "用法: winctl sync 本地目录 远程目录"
+    local src="$1" dst="$2"
+    [ -d "$src" ] || die "本地目录不存在: $src"
+    info "打包 $src 并通过 SSH 解包到 $dst ..."
+    tar -C "$src" -czf - . | ssh win "if (-not (Test-Path '$dst')) { New-Item -ItemType Directory -Force -Path '$dst' | Out-Null }; tar -xzf - -C '$dst'"
+    ok "同步完成"
+}
+
+cmd_rdp() {
+    need_setup
+    # shellcheck disable=SC1091
+    . "$CONF_DIR/win.env"
+    echo "远程桌面地址: $WIN_HOST:3389"
+    echo "手机端用 “Windows App”(微软远程桌面) 新建 PC，地址填 $WIN_HOST 即可，账号用 Windows 登录名+密码。"
+    echo "若是家庭版没有 RDP，请改用 RustDesk（电脑装服务端、手机装客户端，双方登录同一 ID/中继）。"
+}
+
+case "${1:-}" in
+    setup) shift; cmd_setup "$@" ;;
+    info)  cmd_info ;;
+    test)  cmd_test ;;
+    ssh)   shift; cmd_ssh "$@" ;;
+    files) cmd_files ;;
+    get)   shift; cmd_get "$@" ;;
+    put)   shift; cmd_put "$@" ;;
+    sync)  shift; cmd_sync "$@" ;;
+    rdp)   cmd_rdp ;;
+    ""|-h|--help|help) usage ;;
+    *) echo "× 未知子命令: $1" >&2; usage; exit 1 ;;
+esac

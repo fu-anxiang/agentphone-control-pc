@@ -1,0 +1,12 @@
+#!/data/data/com.coomi.android/files/usr/bin/sh
+# pl —— 在 ProotLinux 客户机里执行命令（引擎 proot 运行时未就绪时的后备启动器）
+#   pl winctl info                 在客户机里跑命令（客户机 PATH，参数原样传递）
+#   pl -c 'curl https://x | head'  跑一段 shell 脚本
+V=/data/data/com.coomi.android/files/home/.coomi/runtime-v2/versions/local-ubuntu
+[ -x "$V/run.sh" ] || { echo "× 找不到 ProotLinux 启动器: $V/run.sh" >&2; exit 1; }
+[ $# -eq 0 ] && exec "$V/run.sh" /bin/bash
+if [ "$1" = "-c" ]; then
+  shift
+  exec "$V/run.sh" /bin/bash -c "$*"
+fi
+exec "$V/run.sh" /bin/bash -c '"$@"' bash "$@"
