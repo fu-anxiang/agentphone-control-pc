@@ -92,8 +92,29 @@ git grep -n "room=[A-Za-z0-9_-]\{20,\}" || echo "✓ 没有真实令牌"
 `.gitignore` 已排除：`config.json`、`ROOM.txt`、`.pcc.env`、`logs/`、`dist/`、
 `*.supervisor.*`、`qr*.png`、`shots/`、`__pycache__/`。
 
+## 仓库描述与 Topics
+
+一条命令就能设置（已写好 `bin/set-repo-meta.sh`）：
+
+```sh
+GITHUB_TOKEN=github_pat_xxx ./bin/set-repo-meta.sh
+```
+
+会设成：
+
+- **Description**：`用手机控制 Windows 电脑：pcrelay 边缘中继 + SSH 双通道（命令/键鼠/截屏/文件/浏览器自动化）`
+- **Topics**：`windows` `remote-control` `rpc` `android` `automation` `ssh` `tailscale`
+  `cloudflare-workers` `durable-objects` `powershell` `python`
+
+> ⚠ **这一步需要令牌带 `Administration: Read and write`**。
+> 只管代码的 `Contents: Read and write` 不够 —— 改描述/Topics 属于仓库管理权限，
+> 只给 Contents 会返回 `403 Resource not accessible by personal access token`（已实测）。
+>
+> 不想改令牌权限的话，就在网页上填（About 右侧齿轮 → Description / Topics），
+> 值照上面粘即可。
+
 ## 建议在网页上补的仓库信息
 
-- **About → Description**：`用手机控制 Windows 电脑：pcrelay 中继 + SSH 双通道`
-- **Topics**：`windows` `remote-control` `android` `automation` `ssh` `tailscale`
-- 这些设置需要浏览器操作（或带 token 的 API 调用）
+- **About → Description**：见上一节的 `bin/set-repo-meta.sh`
+- **Topics**：同上
+- 这两项也能用 `bin/set-repo-meta.sh` 一次设好（需要 Administration 权限）
