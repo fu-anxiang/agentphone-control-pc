@@ -1,0 +1,11 @@
+# Cloudflare / wrangler 产物与本地凭据
+node_modules/
+.wrangler/
+dist/
+.dev.vars
+.dev.vars.*
+
+# 绝不提交：Cloudflare 凭据
+.env
+.env.*
+*.pem

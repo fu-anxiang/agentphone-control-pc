@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<title>PC Remote (edge relay)</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:#0b0f14;color:#c9d6e4;font:14px/1.4 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif;overflow:hidden;overscroll-behavior:none}
+#stage{position:fixed;inset:0 0 58px 0;display:flex;align-items:center;justify-content:center;touch-action:none}
+#scr{max-width:100%;max-height:100%;display:block;background:#000}
+#bar{position:fixed;left:0;right:0;bottom:0;padding:6px 8px calc(6px + env(safe-area-inset-bottom));display:flex;gap:6px;flex-wrap:wrap;background:rgba(11,15,20,.95);border-top:1px solid #1b2733;z-index:5}
+button{background:#15202b;color:#c9d6e4;border:1px solid #22303d;border-radius:9px;padding:8px 10px;font-size:13px;min-width:42px;min-height:36px}
+button:active{background:#243546}
+button.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
+#stat{position:fixed;top:0;left:0;right:0;padding:4px 10px;font-size:11px;color:#7f93a8;background:linear-gradient(rgba(11,15,20,.9),transparent);z-index:5;pointer-events:none}
+#kbd{position:fixed;left:0;right:0;bottom:0;padding:8px;background:rgba(11,15,20,.98);border-top:1px solid #1b2733;display:none;gap:6px;z-index:9;flex-direction:column}
+#kbd input{width:100%;padding:11px;font-size:16px;border-radius:9px;border:1px solid #22303d;background:#0e1620;color:#e6eef7}
+#kbd .row{display:flex;gap:6px;flex-wrap:wrap}
+#login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;background:#0b0f14;z-index:20;padding:24px;text-align:center}
+#login input{padding:12px;border-radius:10px;border:1px solid #22303d;background:#0e1620;color:#e6eef7;font-size:16px;text-align:center;width:260px}
+.hint{color:#5d7285;font-size:12px}
+</style>
+</head>
+<body>
+<div id="stage"><img id="scr" alt=""></div>
+<div id="stat">连接中…</div>
+<div id="bar">
+  <button id="bLeft" class="on">左键</button>
+  <button id="bRight">右键</button>
+  <button id="bKb">键盘</button>
+  <button id="bEsc">Esc</button>
+  <button id="bEnter">Enter</button>
+  <button id="bTab">Tab</button>
+  <button id="bWin">Win</button>
+  <button id="bCtrlC">Ctrl+C</button>
+  <button id="bCtrlV">Ctrl+V</button>
+  <button id="bAltTab">Alt+Tab</button>
+  <button id="bUp">滚↑</button>
+  <button id="bDn">滚↓</button>
+  <button id="bFull">全屏</button>
+</div>
+<div id="kbd">
+  <input id="kbIn" placeholder="这里输入文字，回车发送到电脑" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+  <div class="row">
+    <button id="kbSend">发送</button>
+    <button id="kbBack">⌫</button>
+    <button id="kbEnter">Enter</button>
+    <button id="kbClose">收起</button>
+  </div>
+</div>
+<div id="login">
+  <div>输入电脑端显示的连接码</div>
+  <input id="rm" placeholder="room / token" autocapitalize="off" autocomplete="off">
+  <button id="rmGo">连接电脑</button>
+  <div class="hint">首次打开会记住连接码；在电脑上运行 pcrelay 客户端会显示它</div>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+const qs = new URLSearchParams(location.search);
+let room = qs.get('room') || localStorage.getItem('pcrelay_room') || '';
+let ws = null, img = $('#scr'), button = 'left';
+let dragging = false, moved = false, startT = 0, lastX = 0, lastY = 0, pinch = null, lastTap = 0;
+let fpsCnt = 0, fpsT = performance.now(), hasPeer = false, lastFrameAt = 0;
+
+function send(o){ if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+function setStat(t){ $('#stat').textContent = t; }
+function lockOverlay(on){
+  let el = $('#lockmsg');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'lockmsg';
+    el.style.cssText = 'position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:rgba(8,12,17,.94);z-index:30;font-size:17px;color:#e6eef7;text-align:center;padding:24px';
+    el.innerHTML = '电脑已锁屏<span style="font-size:12px;color:#7f93a8">整屏画面与触控暂停；解锁后自动恢复<br>（agent 的 pw / shell 不受影响，仍可远程干活）</span>';
+    document.body.appendChild(el);
+  }
+  el.style.display = on ? 'flex' : 'none';
+}
+
+function connect(){
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${proto}://${location.host}/ws?role=phone&room=${encodeURIComponent(room)}`;
+  ws = new WebSocket(url);
+  ws.binaryType = 'blob';
+  ws.onopen = () => { setStat('已连接边缘节点，等待电脑…'); $('#login').style.display = 'none'; };
+  ws.onclose = () => { setStat('断开，重连中…'); setTimeout(connect, 1500); };
+  ws.onerror = () => setStat('连接错误');
+  ws.onmessage = ev => {
+    if (typeof ev.data === 'string') {
+      let m; try { m = JSON.parse(ev.data); } catch(e){ return; }
+      if (m.t === 'peer') {
+        hasPeer = m.event === 'join' || m.role === 'pc';
+        setStat(hasPeer ? '电脑在线' : '等待电脑…');
+      } else if (m.t === 'state') {
+        lockOverlay(m.locked);
+      } else if (m.t === 'info') {
+        setStat(`电脑在线 ${m.w}x${m.h}`);
+      }
+      return;
+    }
+    const url2 = URL.createObjectURL(ev.data);
+    img.onload = () => URL.revokeObjectURL(url2);
+    img.src = url2;
+    lastFrameAt = Date.now();
+    fpsCnt++;
+    const now = performance.now();
+    if (now - fpsT > 1000) { setStat(`已连接 · ${(fpsCnt * 1000 / (now - fpsT)).toFixed(1)} fps`); fpsCnt = 0; fpsT = now; }
+    send({t: 'ack'});
+  };
+}
+
+function showLogin(){ $('#login').style.display = 'flex'; $('#rm').value = room; }
+$('#rmGo').onclick = () => {
+  room = $('#rm').value.trim();
+  if (!room) return;
+  localStorage.setItem('pcrelay_room', room);
+  connect();
+};
+if (!room) showLogin(); else connect();
+setInterval(() => {
+  if (ws && ws.readyState === 1 && lastFrameAt && Date.now() - lastFrameAt > 4000) setStat('电脑离线/画面暂停');
+}, 2000);
+
+function norm(t){
+  const r = img.getBoundingClientRect();
+  return [Math.min(1, Math.max(0, (t.clientX - r.left) / r.width)),
+          Math.min(1, Math.max(0, (t.clientY - r.top) / r.height))];
+}
+
+const stage = $('#stage');
+stage.addEventListener('touchstart', e => {
+  if (e.touches.length === 2) { pinch = { y: (e.touches[0].clientY + e.touches[1].clientY) / 2 }; dragging = false; return; }
+  const t = e.touches[0];
+  dragging = true; moved = false; startT = Date.now(); lastX = t.clientX; lastY = t.clientY;
+  e.preventDefault();
+}, {passive:false});
+
+stage.addEventListener('touchmove', e => {
+  if (e.touches.length === 2 && pinch) {
+    const y = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+    const dy = y - pinch.y;
+    if (Math.abs(dy) > 6) { send({t:'wheel', dy: dy > 0 ? -120 : 120}); pinch.y = y; }
+    e.preventDefault(); return;
+  }
+  if (!dragging) return;
+  const t = e.touches[0];
+  const dx = t.clientX - lastX, dy = t.clientY - lastY;
+  if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+  lastX = t.clientX; lastY = t.clientY;
+  const r = img.getBoundingClientRect();
+  send({t:'mv', dx: dx / r.width, dy: dy / r.height});
+  e.preventDefault();
+}, {passive:false});
+
+stage.addEventListener('touchend', e => {
+  if (e.touches.length > 0) return;
+  pinch = null;
+  if (!dragging) return;
+  dragging = false;
+  const dt = Date.now() - startT;
+  if (!e.changedTouches.length) return;
+  const [x, y] = norm(e.changedTouches[0]);
+  if (!moved && dt < 300) {
+    send({t:'abs', x, y}); send({t:'click', b: button, n: 1});
+    const now = Date.now();
+    if (now - lastTap < 300) send({t:'click', b: button, n: 2});
+    lastTap = now;
+  } else if (!moved && dt >= 300) {
+    send({t:'abs', x, y}); send({t:'click', b: 'right', n: 1});
+  }
+}, {passive:false});
+
+$('#bLeft').onclick = () => { button='left'; $('#bLeft').classList.add('on'); $('#bRight').classList.remove('on'); };
+$('#bRight').onclick = () => { button='right'; $('#bRight').classList.add('on'); $('#bLeft').classList.remove('on'); };
+$('#bKb').onclick = () => { const k=$('#kbd'); const on=k.style.display==='flex'; k.style.display=on?'none':'flex'; if(!on) $('#kbIn').focus(); };
+$('#kbClose').onclick = () => { $('#kbd').style.display='none'; $('#kbIn').blur(); };
+$('#bEsc').onclick = () => send({t:'key', k:'esc'});
+$('#bEnter').onclick = () => send({t:'key', k:'enter'});
+$('#bTab').onclick = () => send({t:'key', k:'tab'});
+$('#bWin').onclick = () => send({t:'key', k:'win'});
+$('#bCtrlC').onclick = () => send({t:'key', k:'c', mods:['ctrl']});
+$('#bCtrlV').onclick = () => send({t:'key', k:'v', mods:['ctrl']});
+$('#bAltTab').onclick = () => send({t:'key', k:'tab', mods:['alt']});
+$('#bUp').onclick = () => send({t:'wheel', dy: 120});
+$('#bDn').onclick = () => send({t:'wheel', dy: -120});
+$('#bFull').onclick = () => { if (!document.fullscreenElement) document.documentElement.requestFullscreen?.(); else document.exitFullscreen?.(); };
+$('#kbSend').onclick = () => { const v = $('#kbIn').value; if (v) { send({t:'text', s:v}); $('#kbIn').value=''; } };
+$('#kbBack').onclick = () => send({t:'key', k:'backspace'});
+$('#kbEnter').onclick = () => send({t:'key', k:'enter'});
+$('#kbIn').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('#kbSend').click(); } });
+document.addEventListener('gesturestart', e => e.preventDefault());
+</script>
+</body>
+</html>

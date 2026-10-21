@@ -81,7 +81,7 @@ pcc diag                                     # 一键体检
 | 类别 | 命令 |
 |---|---|
 | 配置 | `pcc init` · `pcc conf` · `pcc link` · `pcc room` |
-| 信息 | `pcc info` · `pcc ping` · `pcc session` · `pcc net` · `pcc diag` |
+| 信息 | `pcc info` · `pcc ping` · `pcc health` · `pcc get` · `pcc session` · `pcc net` · `pcc diag` |
 | 执行 | `pcc sh '<PowerShell>'` |
 | 屏幕 | `pcc shot [文件] [宽]` · `pcc pw screenshot` |
 | 鼠标 | `pcc move` · `pcc click` · `pcc dblclick` · `pcc scroll` · `pcc drag` |
@@ -107,11 +107,16 @@ win/install-bridge.ps1  一键安装（依赖 + 令牌 + 后台 + 自启）
 win/run-bridge.bat      前台运行（看日志）
 win/winctl              SSH 通道客户端（setup/ssh/files/get/put/sync/rdp）
 setup-pc.ps1            备用通道：OpenSSH + 防火墙收紧 + RDP
+relay/                  **中继源码**（Cloudflare Pages + Durable Object，可自建）
 tools/                  OCR / 分段下载 / 中继协议探针（探明接口时用的）
 dev/                    mock 电脑端、回归套件、协议探针
 dev/archive/            一次性调试脚本（保留作参考，不维护）
 docs/                   协议实测表 / 运维手册 / Windows 安装 / SSH 通道
 ```
+
+整套系统是**自包含**的：`relay/` 就是公网那台中继的源码，想要自己的域名/自己的实例，
+照 [relay/README.md](relay/README.md) 用 `wrangler` 部署一套即可，然后
+`pcc init "https://<你的域名>/api?room=AAAA https://<你的域名>/?room=BBBB"`。
 
 ## 已知限制
 
@@ -148,6 +153,11 @@ PCC_ROOM=mock-room python3 dev/selftest.sh
 协议探针（`dev/probe_api*.py`）是当初反推接口用的脚本，保留下来方便以后
 接口再变时快速重新摸一遍。发布与拉取细节见 [docs/PUBLISH.md](docs/PUBLISH.md)。
 
+
+## 更新日志
+
+见 [CHANGELOG.md](CHANGELOG.md)。当前 v0.4.0：新增 `pcc health` / `pcc get`（中继支持 GET），
+并把中继源码 `relay/` 一并入仓，整套系统自包含。
 
 ## 许可证
 

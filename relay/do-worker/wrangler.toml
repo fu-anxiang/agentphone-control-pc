@@ -1,0 +1,12 @@
+name = "pcrelay-do"
+main = "src/index.js"
+compatibility_date = "2025-11-04"
+
+# Durable Object 单独放在 Worker 里；Pages 通过 script_name 绑定调用它，
+# Worker 本身不需要任何对外路由（workers.dev 被封也不影响）。
+[observability]
+enabled = false
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Relay"]

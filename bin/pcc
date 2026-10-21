@@ -20,6 +20,8 @@ pcc —— 手机端通过 pcrelay 边缘中继控制电脑（PC Agent API 客�
     pcc conf                    显示当前配置
     pcc link                    打印 API 与投屏地址
     pcc info                    机器信息（分辨率/锁屏/忙碌）
+    pcc health                  中继自身健康检查（不需要令牌、不需要电脑在线）
+    pcc get [方法]              用 GET 调无参方法（默认 info；适合不方便发 body 时）
     pcc session                 会话状态（是否锁屏、空闲秒数、保活）
     pcc awake on|off            开/关防锁屏保活（电脑空闲时抖动鼠标）
     pcc ping                    探活
@@ -196,6 +198,50 @@ def screen_size():
         sc = info.get("screen") or {}
         _SCREEN = (int(sc.get("w") or 1920), int(sc.get("h") or 1080))
     return _SCREEN
+
+
+def call_get(method="info", timeout=30):
+    """用 GET 调中继（不带请求体）。中继只从 query 取 m，p 恒为空，
+    所以只适合 info/ping/session 这类无参方法 —— 好处是不用构造 JSON。"""
+    if not ROOM:
+        die(f"未配置 Agent 令牌：先跑  pcc init <地址>  或编辑 {ENV_FILE}")
+    url = (f"{BASE}?room={urllib.parse.quote(ROOM)}"
+           f"&m={urllib.parse.quote(method)}")
+    req = urllib.request.Request(url, headers={k: v for k, v in HEADERS.items()
+                                               if k != "content-type"})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+    except Exception as e:
+        die(f"GET 失败：{type(e).__name__}: {e}")
+    dt = int((time.time() - t0) * 1000)
+    try:
+        j = json.loads(raw)
+    except Exception:
+        return {"_raw": raw, "_ms": dt}
+    if j.get("ok") is False:
+        if j.get("e") == "pc_offline":
+            die("电脑离线：电脑端客户端没连上（核对令牌：pcc conf）")
+        die(f"中继返回：{j.get('e')}")
+    r = j.get("r", j)
+    if isinstance(r, dict):
+        r.setdefault("_ms", dt)
+    return r
+
+
+def relay_health(timeout=15):
+    """中继自身的健康检查（不需要令牌，也不需要电脑在线）。"""
+    host = BASE.split("/api")[0]
+    req = urllib.request.Request(f"{host}/health",
+                                 headers={"user-agent": HEADERS["user-agent"]})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as e:
+        die(f"中继不可达 {host}/health：{type(e).__name__}: {e}")
 
 
 def to_px(x, y, norm=False):
@@ -752,6 +798,17 @@ def main(argv):
 
     if cmd == "ping":
         out(json.dumps(call("ping", timeout=20), ensure_ascii=False))
+        return 0
+
+    if cmd == "get":
+        # 中继支持 GET /api?m=xxx（p 恒为空），适合 info/ping/session 这类无参方法
+        method = args[0] if args else "info"
+        r = call_get(method)
+        out(json.dumps(r, ensure_ascii=False, indent=2))
+        return 0
+
+    if cmd == "health":
+        out(json.dumps(relay_health(), ensure_ascii=False))
         return 0
 
     if cmd == "session":

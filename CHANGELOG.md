@@ -1,5 +1,29 @@
 # 手机控制电脑 —— 更新日志
 
+## v0.4.0 · 2026-10-22
+
+### 新增：中继源码入仓（`relay/`）
+
+整套系统现在**自包含**，不再依赖别人部署的中继：
+
+- `relay/wrangler.toml` —— Pages 项目配置（DO 绑定走 `script_name`）
+- `relay/functions/[[path]].js` —— Pages Function：`/ws`、`/api` 转发给 DO，`/health` 直接回 JSON
+- `relay/public/index.html` —— 手机投屏网页（触屏→鼠标、软键盘、滚轮、全屏）
+- `relay/do-worker/**` —— Durable Object：双端 WS 中继 + HTTP-over-WS 隧道（55s 超时、
+  PC 掉线时让在途请求立即 `pc_disconnected`）
+- `relay/README.md` —— 部署步骤、为什么要拆 Pages + Worker、错误码、自建方法
+
+### 新增：两个命令
+
+- `pcc health` —— 中继自身健康检查（`GET /health`，不需要令牌、不需要电脑在线）
+- `pcc get [方法]` —— 用 `GET /api?m=…` 调无参方法（默认 `info`），不方便发 body 时用
+
+### 协议补充（实测）
+
+- `GET /api?m=ping&room=X` 是**可用**的，不带 `m` 时默认 `info`；GET 的 `p` 恒为空
+- `GET /health` → `{"ok":true,"relay":"pcrelay"}`
+- 错误码补全：`pc_offline`(503) / `timeout`(504) / `pc_disconnected` / `missing_method`(400) / `method_not_allowed`(405)
+
 ## v0.3.0 · 2026-10-21
 
 ### 新增：电脑端运维命令（对应 pcremote 的 17 项能力）

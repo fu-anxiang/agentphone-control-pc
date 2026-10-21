@@ -10,10 +10,22 @@
 手机浏览器 ──WSS /ws?role=phone&room=<令牌B>──▶ 同一中继 ──▶ 电脑（JPEG 画面 + 鼠标键盘事件）
 ```
 
-- 中继：`https://pcrelay.pages.dev`（Cloudflare 边缘，Durable Object）
+- 中继：`https://pcrelay.pages.dev`（Cloudflare 边缘，Durable Object）——源码在 [`relay/`](../relay/README.md)
 - Agent API：`POST .../api?room=<令牌A>`，body `{"m": 方法, "p": {...}}`
+- 简写：`GET .../api?m=ping&room=<令牌A>` 也行（不带 `m` 默认 `info`；**GET 的 `p` 恒为空**）
+- 健康检查：`GET .../health` → `{"ok":true,"relay":"pcrelay"}`（不需要令牌）
 - 响应：`{"id":..,"ok":true,"r":{...}}` 或 `{"id":..,"ok":false,"e":"ValueError: ...","tb":"..."}`
 - 投屏：`https://pcrelay.pages.dev/?room=<令牌B>`
+
+### 中继错误码
+
+| 返回 | 含义 |
+|---|---|
+| `{"ok":false,"e":"pc_offline"}` 503 | 电脑端没连上这个房间 |
+| `{"ok":false,"e":"timeout","id":..}` 504 | 电脑端 55 秒内没回（中继 `RPC_TIMEOUT_MS`） |
+| `{"ok":false,"e":"pc_disconnected"}` | 请求在路上时电脑端掉线（比等超时快） |
+| `{"ok":false,"e":"missing_method"}` 400 | 没给 `m`（常见于 PowerShell 吞引号） |
+| `{"ok":false,"e":"method_not_allowed"}` 405 | 用了 PUT/DELETE |
 
 ## 新版权令（2026-10 变更）
 
@@ -103,6 +115,16 @@ print(call("shell", cmd="hostname")["r"]["out"])
 call("pw", action="goto", url="https://example.com")
 print(call("pw", action="text", selector="h1")["r"]["text"])
 ```
+
+不想发 body 的时候可以用 GET（`p` 恒为空，只适合 `info` / `ping` / `session` 这类无参方法）：
+
+```sh
+curl "https://pcrelay.pages.dev/api?room=<令牌A>&m=ping"
+curl "https://pcrelay.pages.dev/api?room=<令牌A>"        # 不带 m 默认 info
+curl "https://pcrelay.pages.dev/health"                  # 中继自身健康检查，不需要令牌
+```
+
+对应的 `pcc` 命令：`pcc get ping`、`pcc get`（=info）、`pcc health`。
 
 多步有状态的浏览器自动化用 `pwscript`：
 
