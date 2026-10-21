@@ -122,19 +122,32 @@ docs/                   协议实测表 / 运维手册 / Windows 安装 / SSH �
 
 ## 开发
 
-```sh
-# 回归测试（需要电脑端在线）
-cp bin/pcc /tmp/pccmod.py
-python3 dev/suite_real.py     # 24 项接口
-python3 dev/suite_ops.py      # 9 项运维命令
+仓库：https://github.com/fu-anxiang/agentphone-control-pc
 
-# 没有电脑端时，用 mock 冒充
+```sh
+git clone git@github.com:fu-anxiang/agentphone-control-pc.git
+cd agentphone-control-pc
+install -m 0755 bin/pcc /usr/local/bin/pcc
+```
+
+改完代码跑回归：
+
+```sh
+cp bin/pcc /tmp/pccmod.py     # 套件从固定路径导入
+python3 dev/suite_real.py     # 24 项接口（需电脑端在线）
+python3 dev/suite_ops.py      # 9 项运维命令
+```
+
+没有电脑端时，用 mock 冒充：
+
+```sh
 python3 dev/mockpc.py mock-room 300      # 起一个假电脑
 PCC_ROOM=mock-room python3 dev/selftest.sh
 ```
 
 协议探针（`dev/probe_api*.py`）是当初反推接口用的脚本，保留下来方便以后
-接口再变时快速重新摸一遍。
+接口再变时快速重新摸一遍。发布与拉取细节见 [docs/PUBLISH.md](docs/PUBLISH.md)。
+
 
 ## 许可证
 
