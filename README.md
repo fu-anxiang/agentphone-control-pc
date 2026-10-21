@@ -108,6 +108,7 @@ win/run-bridge.bat      前台运行（看日志）
 win/winctl              SSH 通道客户端（setup/ssh/files/get/put/sync/rdp）
 setup-pc.ps1            备用通道：OpenSSH + 防火墙收紧 + RDP
 relay/                  **中继源码**（Cloudflare Pages + Durable Object，可自建）
+skill/                  **可复用的 Coomi Skill**（下次开新会话直接装上就用）
 tools/                  OCR / 分段下载 / 中继协议探针（探明接口时用的）
 dev/                    mock 电脑端、回归套件、协议探针
 dev/archive/            一次性调试脚本（保留作参考，不维护）
@@ -153,6 +154,26 @@ PCC_ROOM=mock-room python3 dev/selftest.sh
 协议探针（`dev/probe_api*.py`）是当初反推接口用的脚本，保留下来方便以后
 接口再变时快速重新摸一遍。发布与拉取细节见 [docs/PUBLISH.md](docs/PUBLISH.md)。
 
+
+## 给 AI Agent 用：Skill
+
+整套能力已封装成 Coomi Skill `controlling-windows-pc`，新会话直接加载即可，
+不用重新摸协议：
+
+```sh
+cp -r skill/controlling-windows-pc ~/.coomi/skills/     # 或 install_skill(source=...)
+```
+
+Skill 里写了：两条通道怎么选、每场必做的 `pcc conf` + `pcc diag`、命令速查、
+**四个会静默失效的参数名陷阱**、锁屏的正确处理、故障→命令对照表、改完代码的回归流程。
+
+凭据**不在** Skill 里，单独放在 `~/.config/pcc/secrets.env`（600）：
+
+```sh
+set -a; . ~/.config/pcc/secrets.env; set +a     # $GITHUB_TOKEN / $GH_OWNER / $GH_REPO
+```
+
+见 [skill/README.md](skill/README.md)。
 
 ## 更新日志
 

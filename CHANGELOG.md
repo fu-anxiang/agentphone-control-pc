@@ -1,5 +1,28 @@
 # 手机控制电脑 —— 更新日志
 
+## v0.5.0 · 2026-10-22
+
+### 新增：可复用的 Coomi Skill（`skill/controlling-windows-pc`）
+
+把整套操作知识封装成 Skill，下次开新会话直接加载，不用重新探协议：
+
+- 两条通道怎么选（`pcc` 中继 / `winctl` SSH）
+- **每场开场固定动作**：`pcc conf` + `pcc diag`（10 项），别盲试
+- 命令速查（执行 / 屏幕 / 键鼠 / 窗口 / 文件 / 剪贴板 / 浏览器 / 运维）
+- **四个参数名陷阱**（`value`/`match`/`count`/`set`/`content`/`scroll`）——写错不报错只静默失效
+- 锁屏的正确处理（不是绕过，是别让它锁）
+- 故障 → 命令 对照表
+- 改完代码的回归流程（33 项）
+
+安装：`cp -r skill/controlling-windows-pc ~/.coomi/skills/`
+
+### 新增：凭据集中管理
+
+`~/.config/pcc/secrets.env`（600）保存 `GITHUB_TOKEN`、仓库信息、两把 SSH 私钥路径。
+**不写进 Skill 正文、不写进仓库** —— skill 只引用路径，泄了只需删一个文件。
+
+房间令牌仍在 `~/.pcc.env`（`pcc init` 写入），SSH 私钥仍在 `~/.ssh/`（600）。
+
 ## v0.4.0 · 2026-10-22
 
 ### 新增：中继源码入仓（`relay/`）
